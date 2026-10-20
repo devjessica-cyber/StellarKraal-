@@ -17,11 +17,10 @@ import { randomUUID } from "crypto";
 
 export interface WebhookDeliveryAttempt {
   attemptNumber: number;
-  status: "success" | "failed";
-  responseCode: number | null;
-  latencyMs: number;
-  error: string | null;
   attemptedAt: Date;
+  status: "success" | "failed";
+  error: string | null;
+  nextRetryAt: Date | null;
 }
 
 export interface WebhookDelivery {
@@ -139,16 +138,41 @@ export class WebhookRetryService {
   }
 
   /**
+   * Enqueue a failed webhook delivery for automatic retry.
+   *
+   * Convenience entry point used by callers when a delivery fails: it
+   * schedules the first retry attempt (attempt 1 → 1 s backoff) and records
+   * the originating error so the retry history is complete.
+   *
+   * @param webhookId - ID of the registered webhook.
+   * @param url - Destination URL.
+   * @param payload - Event payload object.
+   * @param error - The error that caused the initial delivery to fail.
+   * @returns The newly created {@link WebhookDelivery} record.
+   */
+  async enqueueFailedDelivery(
+    webhookId: string,
+    url: string,
+    payload: object,
+    error: string | null = null
+  ): Promise<WebhookDelivery> {
+    const delivery = await this.scheduleRetry(webhookId, url, payload, 1);
+    delivery.lastError = error;
+    inMemoryStore.set(delivery.id, delivery);
+    return delivery;
+  }
+
+  /**
    * Process a pending delivery by attempting an HTTP POST to its URL.
    *
    * - On success (2xx): marks the record `success`.
    * - On failure (non-2xx or network error):
    *   - If `attemptNumber < maxAttempts`: bumps attempt counter, updates
    *     `nextRetryAt` with the next backoff window, keeps status `pending`.
-   *   - If `attemptNumber >= maxAttempts`: marks the record `permanent_failure`
-   *     and writes it to the dead-letter store.
+   *   - If `attemptNumber >= maxAttempts`: marks the record `failed`.
    *
-   * Each attempt is recorded with its status, response code, and latency.
+   * Every attempt is appended to `attempts` so the delivery history exposes
+   * the full retry trail.
    *
    * @param deliveryId - ID of the delivery record to process.
    * @returns The updated {@link WebhookDelivery} record.
@@ -163,9 +187,6 @@ export class WebhookRetryService {
     const now = new Date();
     delivery.updatedAt = now;
 
-    const startedAt = Date.now();
-    let responseCode: number | null = null;
-    let attemptError: string | null = null;
     let succeeded = false;
 
     try {
@@ -179,9 +200,12 @@ export class WebhookRetryService {
 
       if (response.ok) {
         succeeded = true;
+        delivery.status = "success";
+        delivery.lastError = null;
+        delivery.nextRetryAt = null;
       } else {
         // Non-2xx response counts as failure
-        attemptError = `HTTP ${response.status}: ${response.statusText}`;
+        delivery.lastError = `HTTP ${response.status}: ${response.statusText}`;
       }
     } catch (err: unknown) {
       attemptError = err instanceof Error ? err.message : String(err);
@@ -206,16 +230,41 @@ export class WebhookRetryService {
       return delivery;
     }
 
-    delivery.lastError = attemptError;
+    if (succeeded) {
+      delivery.attempts.push({
+        attemptNumber: delivery.attemptNumber,
+        attemptedAt: now,
+        status: "success",
+        error: null,
+        nextRetryAt: null,
+      });
+      inMemoryStore.set(deliveryId, delivery);
+      return delivery;
+    }
 
     // Delivery failed — check whether we can retry
     if (delivery.attemptNumber < this.maxAttempts) {
       const nextAttempt = delivery.attemptNumber + 1;
+      const nextRetryAt = new Date(now.getTime() + this.calculateBackoff(nextAttempt));
+      delivery.attempts.push({
+        attemptNumber: delivery.attemptNumber,
+        attemptedAt: now,
+        status: "failed",
+        error: delivery.lastError,
+        nextRetryAt,
+      });
       delivery.attemptNumber = nextAttempt;
       delivery.status = "pending";
-      delivery.nextRetryAt = new Date(now.getTime() + this.calculateBackoff(nextAttempt));
+      delivery.nextRetryAt = nextRetryAt;
     } else {
-      delivery.status = "permanent_failure";
+      delivery.attempts.push({
+        attemptNumber: delivery.attemptNumber,
+        attemptedAt: now,
+        status: "failed",
+        error: delivery.lastError,
+        nextRetryAt: null,
+      });
+      delivery.status = "failed";
       delivery.nextRetryAt = null;
       this.moveToDeadLetter(delivery);
     }
@@ -275,6 +324,10 @@ export class WebhookRetryService {
 
   /**
    * Retrieve the delivery history for a specific webhook.
+   *
+   * Each record includes its `attempts` array so callers (e.g. the
+   * `GET /api/v1/webhooks/:id/deliveries` endpoint) can surface the full
+   * retry history.
    *
    * @param webhookId - ID of the webhook to look up.
    * @returns Array of {@link WebhookDelivery} records ordered by creation time (newest first).

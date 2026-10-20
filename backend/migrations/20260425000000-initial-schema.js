@@ -14,59 +14,47 @@ exports.setup = function(options, seedLink) {
   Promise = options.Promise;
 };
 
-exports.up = function(db) {
-  var filePath = path.join(__dirname, 'sqls', '20260425000000-initial-schema-up.sql');
+function readSql(fileName) {
+  var filePath = path.join(__dirname, 'sqls', fileName);
   return new Promise(function(resolve, reject) {
     fs.readFile(filePath, { encoding: 'utf-8' }, function(err, data) {
       if (err) return reject(err);
       resolve(data);
     });
-  }).then(function(data) {
-    return db.runSql(data);
-  }).then(function() {
-    return db.runSql(
-      'CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (' +
-      'id SERIAL PRIMARY KEY, ' +
-      'webhook_id INTEGER, ' +
-      'attempt_number INTEGER NOT NULL, ' +
-      'status VARCHAR(32) NOT NULL, ' +
-      'response_code INTEGER, ' +
-      'latency_ms INTEGER, ' +
-      'error TEXT, ' +
-      'created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()' +
-      ');'
-    );
-  }).then(function() {
-    return db.runSql(
-      'CREATE TABLE IF NOT EXISTS dead_letter_webhooks (' +
-      'id SERIAL PRIMARY KEY, ' +
-      'webhook_id INTEGER, ' +
-      'url TEXT NOT NULL, ' +
-      'payload JSONB NOT NULL, ' +
-      'attempts INTEGER NOT NULL DEFAULT 0, ' +
-      'last_response_code INTEGER, ' +
-      'last_error TEXT, ' +
-      'replayed_at TIMESTAMP WITH TIME ZONE, ' +
-      'created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()' +
-      ');'
-    );
   });
+}
+
+// Split a SQL script into individual statements so each can be executed
+// through the driver. This keeps the migration portable across SQLite and
+// PostgreSQL, which do not both accept multi-statement runSql payloads.
+function splitStatements(sql) {
+  return sql
+    .split(/;\s*(?:\r?\n|$)/)
+    .map(function(statement) {
+      return statement.trim();
+    })
+    .filter(function(statement) {
+      return statement.length > 0 && statement.indexOf('--') !== 0;
+    });
+}
+
+function runScript(db, fileName) {
+  return readSql(fileName).then(function(sql) {
+    var statements = splitStatements(sql);
+    return statements.reduce(function(chain, statement) {
+      return chain.then(function() {
+        return db.runSql(statement);
+      });
+    }, Promise.resolve());
+  });
+}
+
+exports.up = function(db) {
+  return runScript(db, '20260425000000-initial-schema-up.sql');
 };
 
 exports.down = function(db) {
-  var filePath = path.join(__dirname, 'sqls', '20260425000000-initial-schema-down.sql');
-  return new Promise(function(resolve, reject) {
-    fs.readFile(filePath, { encoding: 'utf-8' }, function(err, data) {
-      if (err) return reject(err);
-      resolve(data);
-    });
-  }).then(function(data) {
-    return db.runSql(data);
-  }).then(function() {
-    return db.runSql('DROP TABLE IF EXISTS dead_letter_webhooks;');
-  }).then(function() {
-    return db.runSql('DROP TABLE IF EXISTS webhook_delivery_attempts;');
-  });
+  return runScript(db, '20260425000000-initial-schema-down.sql');
 };
 
 exports._meta = {
